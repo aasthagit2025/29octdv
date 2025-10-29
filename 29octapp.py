@@ -1,34 +1,77 @@
+# 29octapp.py
+"""
+Final Data Validation Streamlit App
+- Next Question only skip auto-adjust (uses raw data sequence)
+- DK/Refused persisted in session_state to avoid NameError
+- Multi-select completeness, Range, DK, Junk OE, Straightliner checks
+- Validation Rules and Validation Report downloads
+"""
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import re
 import io
 from datetime import datetime
-from typing import List, Dict, Tuple
+from typing import List, Tuple
 
-# Page config
-st.set_page_config(page_title="KnowledgeExcel — Data Validation Automation (Final)", layout="wide")
-st.title("KnowledgeExcel — Data Validation Automation (Final)")
+# ---------------- Configuration (editable) ----------------
+RESPONDENT_ID_CANDIDATES = ["RESPID","RespondentID","CaseID","caseid","id","ID","Respondent Id","sys_RespNum"]
+DEFAULT_DK_CODES = [88, 99]
+DEFAULT_DK_TOKENS = ["DK","Refused","Don't know","Dont know","Refuse","REFUSED"]
 
+# ---------------- Page ----------------
+st.set_page_config(page_title="KnowledgeExcel — DV Automation (29octapp)", layout="wide")
+st.title("KnowledgeExcel — Data Validation Automation (29octapp)")
 st.markdown(
-    "Flow: Generate Validation Rules → Download & Review (optional) → Upload revised rules (optional) → Confirm → Generate Validation Report. "
-    "After generation, preview **Detailed Checks** and download both files (Rules + Report)."
+    "Flow: Upload Raw Data + Sawtooth Skips (Skips.csv format) → Run → Download Validation Rules → (Optional) Upload revised rules → Confirm → Download Validation Report."
 )
 
-# ---------------- Sidebar: uploads and controls ----------------
-st.sidebar.header("Upload files")
-raw_file = st.sidebar.file_uploader("Raw Data (Excel or CSV)", type=["xlsx", "xls", "csv"])
-skips_file = st.sidebar.file_uploader("Sawtooth Skips (CSV/XLSX)", type=["csv", "xlsx"])
+# ---------------- Sidebar uploads & controls ----------------
+st.sidebar.header("Upload files (Skips.csv: Skip From | Skip Type | Skip To | Logic | Comment)")
+raw_file = st.sidebar.file_uploader("Raw Data (Excel or CSV)", type=["xlsx","xls","csv"])
+skips_file = st.sidebar.file_uploader("Sawtooth Skips (CSV/XLSX) - use provided Skips.csv format", type=["csv","xlsx"])
 rules_template_file = st.sidebar.file_uploader("Optional: Validation Rules template (xlsx)", type=["xlsx"])
-run_btn = st.sidebar.button("Run Full DV Automation: Build Validation Rules")
 
+run_btn = st.sidebar.button("Run Full DV Automation: Build Validation Rules")
 st.sidebar.markdown("---")
 st.sidebar.header("Tuning parameters")
 straightliner_threshold = st.sidebar.slider("Straightliner threshold", 0.50, 0.98, 0.85, 0.01)
 junk_repeat_min = st.sidebar.slider("Junk OE: min repeated chars", 2, 8, 4, 1)
 junk_min_length = st.sidebar.slider("Junk OE: min OE length", 1, 10, 2, 1)
 
-# ---------------- xlsxwriter check ----------------
+st.sidebar.markdown("---")
+st.sidebar.header("DK / Refused (editable)")
+dk_codes_input = st.sidebar.text_input("DK numeric codes (comma separated)", value=",".join(map(str, DEFAULT_DK_CODES)))
+dk_tokens_input = st.sidebar.text_input("DK text tokens (comma separated)", value=",".join(DEFAULT_DK_TOKENS))
+
+# ---------------- parse DK inputs & persist to session_state ----------------
+def parse_dk_codes(s: str) -> List[int]:
+    try:
+        parts = [p.strip() for p in s.split(",") if p.strip()!='']
+        return [int(float(p)) for p in parts]
+    except Exception:
+        return DEFAULT_DK_CODES
+
+def parse_dk_tokens(s: str) -> List[str]:
+    try:
+        parts = [p.strip() for p in re.split(r',|\;|\|', s) if p.strip()!='']
+        return parts
+    except Exception:
+        return DEFAULT_DK_TOKENS
+
+# compute DK lists and save in session_state so they persist across reruns
+try:
+    DK_CODES = parse_dk_codes(dk_codes_input)
+    DK_TOKENS = parse_dk_tokens(dk_tokens_input)
+except Exception:
+    DK_CODES = DEFAULT_DK_CODES
+    DK_TOKENS = DEFAULT_DK_TOKENS
+
+st.session_state["DK_CODES"] = DK_CODES
+st.session_state["DK_TOKENS"] = DK_TOKENS
+
+# ---------------- xlsxwriter availability ----------------
 try:
     import xlsxwriter  # noqa: F401
     XLSXWRITER_AVAILABLE = True
@@ -36,14 +79,13 @@ except Exception:
     XLSXWRITER_AVAILABLE = False
     st.sidebar.warning("xlsxwriter not installed — Excel formatting will be basic. Add 'xlsxwriter' to requirements.txt for full formatting.")
 
-# ---------------- Utility & cached readers ----------------
+# ---------------- Helper utilities ----------------
 @st.cache_data(show_spinner=False)
 def read_any_df_cached(uploaded_bytes: bytes, name: str):
-    """Read a file from bytes. Return pandas DataFrame."""
     bio = io.BytesIO(uploaded_bytes)
-    name = name.lower()
+    n = name.lower()
     try:
-        if name.endswith((".xlsx", ".xls")):
+        if n.endswith((".xlsx", ".xls")):
             return pd.read_excel(bio, engine="openpyxl")
         else:
             return pd.read_csv(bio, encoding="utf-8-sig")
@@ -60,115 +102,6 @@ def read_any_df(uploaded):
         return None
     uploaded.seek(0)
     return read_any_df_cached(uploaded.read(), uploaded.name)
-
-def is_probably_multiselect_block(vars_list: List[str], var: str) -> bool:
-    """Detect pattern like Q1_1, Q1_2, Q1_3 — underscore + number suffix."""
-    return bool(re.search(r'_[0-9]+$', var))
-
-def is_probably_grid_block(vars_list: List[str], var: str) -> bool:
-    """Detect patterns like R1,R2 or letter suffixes a,b,c or R1 style."""
-    # grid heuristics: suffixes like R1,R2... or trailing letters a,b,c or numeric with letter prefix R
-    if re.search(r'R\d+$', var, re.IGNORECASE):
-        return True
-    if re.search(r'[A-Za-z]$', var) and not re.search(r'_[0-9]+$', var):
-        # trailing letter (a,b,c) - more likely rating/attribute item
-        return True
-    return False
-
-def detect_variable_type_and_stats(series: pd.Series) -> Tuple[str, dict]:
-    """
-    Determine Variable_Type: 'Numeric', 'Categorical', 'Open-Ended', or 'Empty'
-    Return (type, stats) where stats includes numeric counts, unique values, example tokens.
-    """
-    s = series.dropna()
-    stats = {"n": len(series), "non_missing": len(s)}
-    if len(s) == 0:
-        return "Empty", stats
-
-    # convert to string samples
-    as_str = s.astype(str).str.strip()
-    # proportion with alphabetic characters
-    has_alpha = as_str.str.contains(r'[A-Za-z]', regex=True).mean()
-    # proportion numeric
-    coerced = pd.to_numeric(s, errors='coerce')
-    numeric_prop = coerced.notna().mean()
-    avg_len = as_str.str.len().mean()
-
-    unique_vals = pd.Series(coerced.dropna().unique()).tolist()
-    stats.update({"numeric_prop": numeric_prop, "has_alpha_prop": has_alpha, "avg_len": avg_len, "unique_numeric_vals": unique_vals, "unique_text_vals": as_str.unique()[:10].tolist()})
-
-    # classification rules
-    # Open-Ended if mostly non-numeric OR average length high OR alphabetic present
-    if (has_alpha > 0.6) or (numeric_prop < 0.3 and avg_len > 10) or (avg_len > 30):
-        return "Open-Ended", stats
-    # Numeric if mostly numeric and small avg length
-    if numeric_prop >= 0.6 and avg_len < 15:
-        return "Numeric", stats
-    # else consider categorical
-    return "Categorical", stats
-
-def group_variables(vars_list: List[str]) -> Dict[str, dict]:
-    """
-    Group variables into logical groups.
-    Return mapping: prefix -> {"vars": [...], "group_type": "...", "label": "..."}
-    """
-    groups = {}
-    for v in vars_list:
-        # prefer prefix before last separator . or _
-        if re.search(r'_[0-9]+$', v):
-            # multi-select pattern Q1_1 -> prefix Q1
-            prefix = re.sub(r'_[0-9]+$','', v)
-            groups.setdefault(prefix, {"vars": [], "group_type": None}).get("vars").append(v)
-        elif re.search(r'R\d+$', v, re.IGNORECASE):
-            prefix = re.sub(r'R\d+$','', v)
-            groups.setdefault(prefix, {"vars": [], "group_type": None}).get("vars").append(v)
-        elif re.search(r'[A-Za-z]$', v) and len(v) > 2:
-            # trailing letter like Q5a Q5b
-            prefix = v[:-1]
-            groups.setdefault(prefix, {"vars": [], "group_type": None}).get("vars").append(v)
-        else:
-            # standalone
-            groups.setdefault(v, {"vars": [], "group_type": None}).get("vars").append(v)
-
-    # Decide group_type for each prefix
-    for prefix, info in groups.items():
-        vars_in_group = info["vars"]
-        # if any var had _# pattern -> Multi-Select Block
-        if any(re.search(r'_[0-9]+$', vv) for vv in vars_in_group):
-            info["group_type"] = f"Multi-Select Block ({prefix}, {len(vars_in_group)} items)"
-        # else if R# or trailing letters -> Rating Grid
-        elif any(re.search(r'R\d+$', vv, re.IGNORECASE) or re.search(r'[A-Za-z]$', vv) for vv in vars_in_group) and len(vars_in_group) > 1:
-            info["group_type"] = f"Rating Grid ({prefix}, {len(vars_in_group)} items)"
-        else:
-            info["group_type"] = "Standalone"
-    return groups
-
-def find_next_valid_target(target_name: str, raw_cols: List[str]) -> Tuple[str, str]:
-    """
-    If target_name not found (e.g., text pages), find the next non-sys_ variable in raw_cols.
-    Return (new_target_name, note). If not found, return ("", note).
-    """
-    # try to find index by approximate matching; if not found, try to find a 'next' by sequence
-    try:
-        # exact match first
-        if target_name in raw_cols:
-            return target_name, "Target exists"
-        # try case-insensitive
-        lower_map = {c.lower(): c for c in raw_cols}
-        if target_name.lower() in lower_map:
-            return lower_map[target_name.lower()], "Target matched case-insensitive"
-    except Exception:
-        pass
-
-    # fallback: find first raw_col that occurs after the position of closest match in skips (not available here)
-    # So choose the first non-sys variable in raw_cols as the conservative next
-    for c in raw_cols:
-        if not str(c).lower().startswith("sys_"):
-            return c, f"Auto-adjusted to first data var: {c}"
-    return "", "No valid data variable found to auto-adjust"
-
-
-# ---------------- Helper functions for validation checks ----------------
 
 def detect_junk_oe(value, junk_repeat_min=4, junk_min_length=2):
     if pd.isna(value):
@@ -187,7 +120,6 @@ def detect_junk_oe(value, junk_repeat_min=4, junk_min_length=2):
         return True
     return False
 
-
 def find_straightliners(df, candidate_cols, threshold=0.85):
     straightliners = {}
     if len(candidate_cols) < 2:
@@ -205,18 +137,13 @@ def find_straightliners(df, candidate_cols, threshold=0.85):
         same_count = (vals == topval).sum()
         frac = same_count / len(non_blank)
         if frac >= threshold:
-            straightliners[idx] = {
-                "value": topval,
-                "same_count": int(same_count),
-                "total": int(len(non_blank)),
-                "fraction": float(frac)
-            }
+            straightliners[idx] = {"value": topval, "same_count": int(same_count), "total": int(len(non_blank)), "fraction": float(frac)}
     return straightliners
 
-
+# parse simple skip expressions into boolean mask (safe eval fallback)
 def parse_skip_expression_to_mask(expr, df):
     try:
-        expr2 = expr.replace("AND", "&").replace("and", "&").replace("OR", "|").replace("or", "|")
+        expr2 = expr.replace("AND","&").replace("and","&").replace("OR","|").replace("or","|")
         for col in df.columns:
             expr2 = re.sub(rf'\b{re.escape(col)}\b', f"df[{repr(col)}]", expr2)
         mask = eval(expr2, {"df": df, "np": np, "pd": pd})
@@ -224,18 +151,62 @@ def parse_skip_expression_to_mask(expr, df):
     except Exception:
         return pd.Series(False, index=df.index)
 
+def group_variables(vars_list: List[str]) -> dict:
+    groups = {}
+    for v in vars_list:
+        if re.search(r'_[0-9]+$', v):
+            prefix = re.sub(r'_[0-9]+$','', v)
+            groups.setdefault(prefix, {"vars": [], "group_type": None}).get("vars").append(v)
+        elif re.search(r'R\d+$', v, re.IGNORECASE):
+            prefix = re.sub(r'R\d+$','', v)
+            groups.setdefault(prefix, {"vars": [], "group_type": None}).get("vars").append(v)
+        elif re.search(r'[A-Za-z]$', v) and len(v) > 2:
+            prefix = v[:-1]
+            groups.setdefault(prefix, {"vars": [], "group_type": None}).get("vars").append(v)
+        else:
+            groups.setdefault(v, {"vars": [], "group_type": None}).get("vars").append(v)
+    for prefix, info in groups.items():
+        vars_in_group = info["vars"]
+        if any(re.search(r'_[0-9]+$', vv) for vv in vars_in_group) and len(vars_in_group) > 1:
+            info["group_type"] = f"Multi-Select Block ({prefix}, {len(vars_in_group)} items)"
+        elif (any(re.search(r'R\d+$', vv, re.IGNORECASE) for vv in vars_in_group) or any(re.search(r'[A-Za-z]$', vv) for vv in vars_in_group)) and len(vars_in_group) > 1:
+            info["group_type"] = f"Rating Grid ({prefix}, {len(vars_in_group)} items)"
+        else:
+            info["group_type"] = "Standalone"
+    return groups
 
-# ---------------- Session state holders ----------------
+def detect_variable_type_and_stats(series: pd.Series) -> Tuple[str, dict]:
+    s = series.dropna()
+    stats = {"n": len(series), "non_missing": len(s)}
+    if len(s) == 0:
+        return "Empty", stats
+    as_str = s.astype(str).str.strip()
+    has_alpha = as_str.str.contains(r'[A-Za-z]', regex=True).mean()
+    coerced = pd.to_numeric(s, errors='coerce')
+    numeric_prop = coerced.notna().mean()
+    avg_len = as_str.str.len().mean()
+    unique_numeric = pd.Series(coerced.dropna().unique()).tolist()
+    stats.update({"numeric_prop": numeric_prop, "has_alpha_prop": has_alpha, "avg_len": avg_len, "unique_numeric_vals": unique_numeric, "sample_text_vals": as_str.unique()[:10].tolist()})
+    if (has_alpha > 0.6) or (numeric_prop < 0.3 and avg_len > 10) or (avg_len > 30):
+        return "Open-Ended", stats
+    if numeric_prop >= 0.6 and avg_len < 15:
+        return "Numeric", stats
+    return "Categorical", stats
+
+# ---------------- session storage ----------------
 if "rules_buf" not in st.session_state:
     st.session_state["rules_buf"] = None
+if "report_buf" not in st.session_state:
+    st.session_state["report_buf"] = None
 if "final_vr_df" not in st.session_state:
     st.session_state["final_vr_df"] = None
+if "detailed_df_preview" not in st.session_state:
+    st.session_state["detailed_df_preview"] = None
 if "rules_generated_time" not in st.session_state:
     st.session_state["rules_generated_time"] = None
 
-# ---------------- Run rule generation ----------------
+# ---------------- Run: Build Validation Rules ----------------
 if run_btn:
-    # Basic validations
     if raw_file is None or skips_file is None:
         st.error("Please upload both Raw Data and Sawtooth Skips files.")
     else:
@@ -244,72 +215,86 @@ if run_btn:
         status.text("Loading files...")
         raw_df = read_any_df(raw_file)
         skips_df = read_any_df(skips_file)
+        rules_wb = None
+        if rules_template_file:
+            try:
+                rules_wb = pd.read_excel(rules_template_file, sheet_name=None)
+            except Exception:
+                rules_wb = None
         progress.progress(10)
 
-        # Detect respondent ID and remove BOM if present
-        possible_ids = ["RESPID","RespondentID","CaseID","caseid","id","ID","Respondent Id","sys_RespNum"]
-        id_col = next((c for c in raw_df.columns if c in possible_ids), raw_df.columns[0])
+        # respondent id
+        id_col = next((c for c in raw_df.columns if c in RESPONDENT_ID_CANDIDATES), raw_df.columns[0])
         id_col = id_col.lstrip("\ufeff")
-
-        # Exclude system vars
         data_vars = [c for c in raw_df.columns if not str(c).lower().startswith("sys_")]
 
-        status.text("Grouping variables and detecting types...")
+        status.text("Grouping variables and detecting variable types...")
         groups = group_variables(data_vars)
-
-        # Precompute per-variable type and stats
         var_types = {}
         var_stats = {}
         for var in data_vars:
             vtype, stats = detect_variable_type_and_stats(raw_df[var])
             var_types[var] = vtype
             var_stats[var] = stats
+        progress.progress(35)
 
-        progress.progress(40)
-
-        # Build validation rules list
+        # Build rules from skips (Skips.csv expected format)
         validation_rules = []
-        DK_CODES = [88, 99]
-        DK_TOKENS = ["DK", "Refused", "Don't know", "Dont know", "Refuse", "REFUSED"]
+        # normalize column names for skips file to known names
+        # we'll look for known headers (case-insensitive): Skip From, Skip Type, Skip To, Logic, Comment
+        skips_cols = {c.strip().lower(): c for c in skips_df.columns}
+        # map columns
+        skip_from_col = skips_cols.get("skip from") or skips_cols.get("question") or skips_cols.get("from") or list(skips_df.columns)[0]
+        skip_type_col = skips_cols.get("skip type") or skips_cols.get("type") or None
+        skip_to_col = skips_cols.get("skip to") or skips_cols.get("target") or skips_cols.get("to") or None
+        logic_col = skips_cols.get("logic") or skips_cols.get("condition") or None
+        comment_col = skips_cols.get("comment") or skips_cols.get("notes") or None
 
-        # Parse skips file to extract skip rules (heuristics)
-        skips_lc = {c.lower(): c for c in skips_df.columns}
-        logic_col = next((skips_lc[c] for c in skips_lc if 'logic' in c or 'condition' in c), None)
-        from_col = next((skips_lc[c] for c in skips_lc if 'skip from' in c or c == 'from' or 'question' in c), None)
-        to_col = next((skips_lc[c] for c in skips_lc if 'skip to' in c or c == 'to' or 'target' in c), None)
-
-        status.text("Building rules from Sawtooth Skips (auto-fix text page targets)...")
-        # iterate skip rows and create rules; if skip target missing, auto-adjust to next valid var
+        status.text("Building rules from Sawtooth Skips (auto-fix targets if 'Next Question')...")
         if logic_col:
             for _, r in skips_df.iterrows():
                 logic = r.get(logic_col, "")
-                src = r.get(from_col, "") if from_col else ""
-                tgt = r.get(to_col, "") if to_col else ""
+                src = r.get(skip_from_col, "") if skip_from_col else ""
+                tgt = r.get(skip_to_col, "") if skip_to_col else ""
                 if pd.isna(logic) or str(logic).strip() == "":
                     continue
                 src_str = str(src).strip() if pd.notna(src) else ""
                 tgt_str = str(tgt).strip() if pd.notna(tgt) else ""
-                # ignore sys_ variables
                 if src_str.lower().startswith("sys_"):
                     continue
-                # Check if src present in data; if not, possibly the 'from' is a text page => try to find nearest
-                if src_str not in raw_df.columns:
-                    # try case-insensitive mapping
-                    lower_map = {c.lower(): c for c in raw_df.columns}
-                    if src_str.lower() in lower_map:
-                        src_str = lower_map[src_str.lower()]
-                # If target not present, auto-fix to next valid variable
-                if tgt_str not in raw_df.columns:
-                    new_tgt, note = find_next_valid_target(tgt_str, list(raw_df.columns))
-                    if new_tgt:
-                        description = f"Skip {src_str} when {logic} (Target {tgt_str} not in data; auto-adjusted → {new_tgt})"
-                        tgt_str = new_tgt
+                # map src case-insensitive to raw_df column if possible
+                lower_map = {c.lower(): c for c in raw_df.columns}
+                if src_str.lower() in lower_map:
+                    src_str = lower_map[src_str.lower()]
+                # ONLY apply auto-adjust when tgt_str explicitly indicates "Next Question"
+                tgt_lower = str(tgt_str).strip().lower()
+                if tgt_lower in ["next", "nextquestion", "next question"]:
+                    # find next variable after src_str in raw_df columns (skip system vars)
+                    cols = list(raw_df.columns)
+                    lower_map_cols = {c.lower(): c for c in cols}
+                    if src_str not in cols and src_str.lower() in lower_map_cols:
+                        src_str = lower_map_cols[src_str.lower()]
+                    if src_str in cols:
+                        pos = cols.index(src_str)
+                        new_tgt = ""
+                        for c in cols[pos + 1:]:
+                            if not str(c).lower().startswith("sys_"):
+                                new_tgt = c
+                                break
+                        if new_tgt:
+                            description = f"Skip {src_str} when {logic} (Target 'Next Question' auto-updated to {new_tgt})"
+                            tgt_str = new_tgt
+                        else:
+                            description = f"Skip {src_str} when {logic} (No next variable found; please review manually)"
                     else:
-                        description = f"Skip {src_str} when {logic} (Target {tgt_str} not in data; NO auto-adjust found — review required)"
+                        description = f"Skip {src_str} when {logic} (Source not found in raw data; unable to update target)"
                 else:
-                    description = f"Skip {src_str} when {logic} (Target: {tgt_str})"
+                    # leave blank or text page targets unchanged
+                    if (tgt_str is None) or (tgt_str == "") or (tgt_str not in raw_df.columns):
+                        description = f"Skip {src_str} when {logic} (Target {tgt_str} not in data; left as-is)"
+                    else:
+                        description = f"Skip {src_str} when {logic} (Target: {tgt_str})"
 
-                # Only add rule if the source variable exists in our data vars
                 if src_str in data_vars:
                     validation_rules.append({
                         "Variable": src_str,
@@ -320,36 +305,31 @@ if run_btn:
                         "Description": description,
                         "Derived From": "Sawtooth Skip"
                     })
+        progress.progress(55)
 
-        progress.progress(60)
-        status.text("Adding smart auto-rules (Range, DK/Refused, Junk OE, Multi-Select groups)...")
-
-        # Smart rule generation for each data variable (excluding sys_)
+        status.text("Generating smart auto-rules for variables...")
+        # smart auto-rules
         for var in data_vars:
             vtype = var_types.get(var, "Categorical")
             stats = var_stats.get(var, {})
-            # Group info
             prefix = re.sub(r'_[0-9]+$','', var) if re.search(r'_[0-9]+$', var) else (re.sub(r'R\d+$','',var) if re.search(r'R\d+$',var, re.IGNORECASE) else (var[:-1] if re.search(r'[A-Za-z]$', var) else var))
             group_info = groups.get(prefix, {"vars":[var], "group_type":"Standalone"})
             group_type = group_info.get("group_type", "Standalone")
 
-            # If Open-Ended -> only Junk OE
             if vtype == "Open-Ended":
                 validation_rules.append({
                     "Variable": var,
                     "Variable_Type": "Open-Ended",
                     "Group_Type": group_type,
                     "Type": "Junk OE",
-                    "Rule Applied": "Junk-OE heuristics (repeats, too short, non-alnum heavy)",
+                    "Rule Applied": "Junk-OE heuristics",
                     "Description": "Open-ended: only junk OE detection applied",
                     "Derived From": "Auto"
                 })
-                # no DK/range rules for OE
                 continue
 
-            # Multi-Select group rules: applied at group level (we'll add identical entries for each var with group label)
-            if re.search(r'_[0-9]+$', var):
-                # Determine group members
+            # Multi-select block
+            if re.search(r'_[0-9]+$', var) and group_type.startswith("Multi-Select"):
                 members = group_info.get("vars", [var])
                 desc = f"Multi-select completeness & validity (group {prefix}, {len(members)} items). Values must be 0/1; no all-missing or all-0 respondent rows."
                 validation_rules.append({
@@ -361,9 +341,8 @@ if run_btn:
                     "Description": desc,
                     "Derived From": "Auto"
                 })
-                # Also add DK rule only if DK tokens or codes present in data
                 series = raw_df[var].dropna().astype(str).str.strip()
-                present_tokens = [t for t in DK_TOKENS if any(series.str.lower() == t.lower())]  # exact match tokens
+                present_tokens = [t for t in DK_TOKENS if any(series.str.lower() == t.lower())]
                 present_codes = []
                 try:
                     numeric_present = pd.to_numeric(raw_df[var], errors='coerce').dropna().astype(int).unique().tolist()
@@ -384,14 +363,11 @@ if run_btn:
                     })
                 continue
 
-            # For numeric/categorical variables not OE or multi-select:
+            # Numeric values -> Range
             series = raw_df[var]
             coerced = pd.to_numeric(series, errors='coerce')
             numeric_vals = coerced.dropna().unique().tolist()
-
-            # Determine if numeric rule should be added
             if len(numeric_vals) > 0:
-                # variable contains numeric entries - create smart range
                 if len(numeric_vals) == 1:
                     lo = hi = int(np.nanmin(coerced.dropna()))
                 else:
@@ -406,7 +382,6 @@ if run_btn:
                     "Description": f"Numeric values expected between {lo} and {hi} based on data",
                     "Derived From": "Auto"
                 })
-                # DK/Refused only if found
                 present_codes = [c for c in DK_CODES if c in [int(x) for x in numeric_vals if float(x).is_integer()]]
                 series_text = series.dropna().astype(str).str.strip()
                 present_tokens = [t for t in DK_TOKENS if any(series_text.str.lower() == t.lower())]
@@ -422,7 +397,7 @@ if run_btn:
                     })
                 continue
             else:
-                # No numeric values -> categorical. Add DK only if present in text values
+                # categorical
                 series_text = series.dropna().astype(str).str.strip()
                 present_tokens = [t for t in DK_TOKENS if any(series_text.str.lower() == t.lower())]
                 if present_tokens:
@@ -436,7 +411,6 @@ if run_btn:
                         "Derived From": "Auto"
                     })
                 else:
-                    # No rules necessary for simple categorical with no DK found
                     validation_rules.append({
                         "Variable": var,
                         "Variable_Type": "Categorical",
@@ -448,9 +422,8 @@ if run_btn:
                     })
         progress.progress(90)
 
-        # Build DataFrame and persist into session_state
+        # Build VR df, persist as Excel bytes
         vr_df = pd.DataFrame(validation_rules)
-        # Ensure ordering by data_vars order for readability
         def var_index(v):
             try:
                 return data_vars.index(v)
@@ -462,7 +435,6 @@ if run_btn:
         else:
             vr_df = pd.DataFrame(columns=["Variable","Variable_Type","Group_Type","Type","Rule Applied","Description","Derived From"])
 
-        # Persist rules in session as bytes for immediate download and for later use
         try:
             rules_buf = io.BytesIO()
             engine_choice = "xlsxwriter" if XLSXWRITER_AVAILABLE else "openpyxl"
@@ -485,7 +457,6 @@ if run_btn:
             st.session_state["rules_buf"] = rules_buf.getvalue()
             st.session_state["final_vr_df"] = vr_df.copy()
             st.session_state["rules_generated_time"] = datetime.utcnow().isoformat()
-            # Show preview and immediate download for review
             st.subheader("Validation Rules — Preview")
             st.dataframe(vr_df, use_container_width=True)
             st.download_button("📥 Download Validation Rules.xlsx (Generated)", data=io.BytesIO(st.session_state["rules_buf"]), file_name="Validation Rules.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -495,23 +466,41 @@ if run_btn:
             st.session_state["rules_buf"] = None
             st.session_state["final_vr_df"] = vr_df.copy()
 
-        progress.progress(100)
+# ---------------- Option: Upload revised rules to override ----------------
+uploaded_rules_override = st.file_uploader("Upload revised Validation Rules.xlsx (optional)", type=["xlsx"])
+if uploaded_rules_override is not None:
+    try:
+        vr_override_df = pd.read_excel(uploaded_rules_override, sheet_name=0)
+        expected_cols = ["Variable","Variable_Type","Group_Type","Type","Rule Applied","Description","Derived From"]
+        if not all(c in vr_override_df.columns for c in expected_cols):
+            st.error(f"Uploaded rules missing required columns. Expected: {expected_cols}")
+        else:
+            # remove sys_ variables
+            vr_override_df = vr_override_df[~vr_override_df['Variable'].astype(str).str.lower().str.startswith("sys_")].reset_index(drop=True)
+            buf_override = io.BytesIO()
+            engine_choice = "xlsxwriter" if XLSXWRITER_AVAILABLE else "openpyxl"
+            with pd.ExcelWriter(buf_override, engine=engine_choice) as writer:
+                vr_override_df.to_excel(writer, sheet_name="Validation_Rules", index=False)
+                if XLSXWRITER_AVAILABLE:
+                    workbook = writer.book
+                    worksheet = writer.sheets["Validation_Rules"]
+                    header_format = workbook.add_format({'bold': True, 'bg_color': '#305496', 'font_color': 'white', 'border':1})
+                    for col_num, value in enumerate(vr_override_df.columns.values):
+                        worksheet.write(0, col_num, value, header_format)
+                    worksheet.freeze_panes(1,1)
+            buf_override.seek(0)
+            st.session_state["rules_buf"] = buf_override.getvalue()
+            st.session_state["final_vr_df"] = vr_override_df.copy()
+            st.success("Uploaded Validation Rules will be used when you Confirm.")
+            st.download_button("📥 Download Uploaded Validation Rules.xlsx", data=io.BytesIO(st.session_state["rules_buf"]), file_name="Validation Rules.xlsx", mime="application/vnd.openxmlformats-officedocument-spreadsheetml.sheet")
+    except Exception as e:
+        st.error("Could not read uploaded Validation Rules.xlsx: " + str(e))
 
-# Confirm & Generate flow, validation execution, report building, persistent downloads.
-
-# Option to upload revised rules (handled in Part 1's uploader). Confirm + generate below.
-
-# Confirm button (if not already created)
-try:
-    confirm_already = confirm_btn  # from Part 1 if present
-except Exception:
-    confirm_already = False
-
-confirm_btn_2 = st.button("✅ Confirm & Generate Validation Report") if not confirm_already else False
-if confirm_btn_2:
+# ---------------- Confirm & Generate Validation Report ----------------
+confirm_btn = st.button("✅ Confirm & Generate Validation Report")
+if confirm_btn:
     st.session_state["_force_generate"] = True
 
-# Allow a shortcut to generate if rules already exist
 if st.session_state.get("_force_generate"):
     final_vr_df = st.session_state.get("final_vr_df")
     if final_vr_df is None:
@@ -519,11 +508,15 @@ if st.session_state.get("_force_generate"):
     elif raw_file is None or skips_file is None:
         st.error("Raw data or skips file missing in current session. Re-run generation.")
     else:
-        # ensure raw_df loaded
+        # ensure DK persisted to local variables (avoid NameError)
+        DK_CODES = st.session_state.get("DK_CODES", DEFAULT_DK_CODES)
+        DK_TOKENS = st.session_state.get("DK_TOKENS", DEFAULT_DK_TOKENS)
+
         raw_df = read_any_df(raw_file)
         data_vars = [c for c in raw_df.columns if not str(c).lower().startswith("sys_")]
-        id_col = next((c for c in raw_df.columns if c in ["RESPID","RespondentID","CaseID","caseid","id","ID","Respondent Id","sys_RespNum"]), raw_df.columns[0])
+        id_col = next((c for c in raw_df.columns if c in RESPONDENT_ID_CANDIDATES), raw_df.columns[0])
         id_col = id_col.lstrip("\ufeff")
+
         status = st.empty()
         progress = st.progress(0)
         status.text("Running validation checks using confirmed rules...")
@@ -535,7 +528,7 @@ if st.session_state.get("_force_generate"):
         def format_ids(ids_series, max_ids=200):
             return ";".join(map(str, ids_series.astype(str).unique()[:max_ids].tolist()))
 
-        # Duplicate ID check
+        # duplicate IDs
         dup_mask = data_df.duplicated(subset=[id_col], keep=False)
         if dup_mask.sum() > 0:
             detailed_findings.append({
@@ -547,22 +540,25 @@ if st.session_state.get("_force_generate"):
             })
         progress.progress(15)
 
-        # Build masks and run checks per rule
-        # Precompute multi-select groups
+        # multi-select group checks
         groups = group_variables(data_vars)
-        # For multi-select completeness and invalid values
         for prefix, info in groups.items():
             if not info["group_type"].startswith("Multi-Select"):
                 continue
-            members = info["vars"]
-            # per-respondent rows
+            members = [m for m in info["vars"] if m in data_df.columns]
+            if not members:
+                continue
             block = data_df[members]
-            # determine missing rows and all-zero rows
             all_missing_mask = block.isnull().all(axis=1)
-            # consider values like '', ' ' as missing
             all_missing_mask = all_missing_mask | (block.applymap(lambda x: str(x).strip()=='').all(axis=1))
-            all_zero_mask = (block.fillna(0).astype(str).applymap(lambda x: x.strip()).isin(['0','0.0','0.00','false','unchecked','False','FALSE','Unchecked','unchecked'])).all(axis=1)
-            # invalid codes - anything not in allowed set 0/1/checked/unchecked/true/false
+            def is_zeroish(x):
+                try:
+                    if pd.isna(x): return False
+                    s = str(x).strip().lower()
+                    return s in ['0','0.0','0.00','false','unchecked']
+                except Exception:
+                    return False
+            all_zero_mask = block.applymap(is_zeroish).all(axis=1)
             allowed = set(['0','1','checked','unchecked','true','false','0.0','1.0'])
             invalid_mask = block.fillna('').astype(str).applymap(lambda x: x.strip().lower() not in allowed).any(axis=1)
             if all_missing_mask.sum() > 0:
@@ -591,7 +587,7 @@ if st.session_state.get("_force_generate"):
                 })
         progress.progress(35)
 
-        # Apply rules in final_vr_df
+        # apply rules
         for _, rule in final_vr_df.iterrows():
             var = str(rule['Variable'])
             rtype = str(rule['Type']).strip().lower()
@@ -605,6 +601,7 @@ if st.session_state.get("_force_generate"):
                 if m:
                     lo, hi = int(m.group(1)), int(m.group(2))
                 coerced = pd.to_numeric(data_df[var], errors='coerce')
+                # Use DK_CODES from session_state already loaded above
                 mask_out = (~coerced.isna()) & (~coerced.isin(DK_CODES)) & ((coerced < lo) | (coerced > hi))
                 if mask_out.sum() > 0:
                     detailed_findings.append({
@@ -660,16 +657,16 @@ if st.session_state.get("_force_generate"):
                         "Affected_Count": int(mask.sum()),
                         "Respondent_IDs": format_ids(data_df.loc[mask, id_col])
                     })
-            # Multi-Select & None are handled above or ignored here
+            # Multi-Select & None handled above
+
         progress.progress(70)
 
-        # Straightliner detection for rating grids
+        # straightliner (rating grids)
         prefixes = {}
         for v in data_vars:
             p = re.split(r'[_\.]', v)[0]
             prefixes.setdefault(p, []).append(v)
         for prefix, cols in prefixes.items():
-            # determine if group is rating grid (based on groups computed earlier)
             gi = groups.get(prefix, {})
             if gi and gi.get("group_type","").startswith("Rating Grid"):
                 sliners = find_straightliners(data_df, gi.get("vars", cols), threshold=straightliner_threshold)
@@ -684,7 +681,7 @@ if st.session_state.get("_force_generate"):
                     })
         progress.progress(90)
 
-        # Build final DataFrames
+        # build and save report
         detailed_df = pd.DataFrame(detailed_findings) if detailed_findings else pd.DataFrame(columns=["Variable","Check_Type","Description","Affected_Count","Respondent_IDs"])
         summary_df = detailed_df.groupby("Check_Type", as_index=False)["Affected_Count"].sum().sort_values("Affected_Count", ascending=False) if not detailed_df.empty else pd.DataFrame(columns=["Check_Type","Affected_Count"])
         project_info = pd.DataFrame({
@@ -695,7 +692,7 @@ if st.session_state.get("_force_generate"):
             "Variables Validated":[len(data_vars)]
         })
 
-        # Persist rules_buf if not present
+        # ensure rules_buf exists
         if st.session_state.get("rules_buf") is None and final_vr_df is not None:
             try:
                 buf_r = io.BytesIO()
@@ -707,7 +704,6 @@ if st.session_state.get("_force_generate"):
             except Exception:
                 pass
 
-        # Create report_buf
         report_buf = io.BytesIO()
         try:
             engine_choice = "xlsxwriter" if XLSXWRITER_AVAILABLE else "openpyxl"
@@ -742,7 +738,7 @@ if st.session_state.get("_force_generate"):
             st.error("Could not prepare Validation Report: " + str(e))
             st.session_state["report_buf"] = None
 
-# ---------------- Display Detailed Checks preview and persistent downloads ----------------
+# ---------------- Preview + Downloads ----------------
 if st.session_state.get("detailed_df_preview") is not None:
     st.subheader("Detailed Checks — Preview (first 200 rows)")
     try:
@@ -759,6 +755,6 @@ if st.session_state.get("detailed_df_preview") is not None:
         if st.session_state.get("report_buf") is not None:
             st.download_button("📥 Download Validation Report.xlsx", data=io.BytesIO(st.session_state["report_buf"]), file_name="Validation Report.xlsx", mime="application/vnd.openxmlformats-officedocument-spreadsheetml.sheet")
         else:
-            st.info("Validation Report file not available for download yet.")
+            st.info("Validation Report file not available for download yet")
 
 # EOF
