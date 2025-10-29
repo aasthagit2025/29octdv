@@ -167,6 +167,64 @@ def find_next_valid_target(target_name: str, raw_cols: List[str]) -> Tuple[str, 
             return c, f"Auto-adjusted to first data var: {c}"
     return "", "No valid data variable found to auto-adjust"
 
+
+# ---------------- Helper functions for validation checks ----------------
+
+def detect_junk_oe(value, junk_repeat_min=4, junk_min_length=2):
+    if pd.isna(value):
+        return False
+    s = str(value).strip()
+    if s == "":
+        return True
+    if s.isdigit() and len(s) <= 3:
+        return True
+    if re.match(r'^(.)\1{' + str(max(1, junk_repeat_min-1)) + r',}$', s):
+        return True
+    non_alnum_ratio = len(re.sub(r'[A-Za-z0-9]', '', s)) / max(1, len(s))
+    if non_alnum_ratio > 0.6:
+        return True
+    if len(s) <= junk_min_length:
+        return True
+    return False
+
+
+def find_straightliners(df, candidate_cols, threshold=0.85):
+    straightliners = {}
+    if len(candidate_cols) < 2:
+        return straightliners
+    m = df[candidate_cols].astype(str).fillna("")
+    for idx, row in m.iterrows():
+        non_blank = row.replace("", np.nan).dropna()
+        if len(non_blank) < 2:
+            continue
+        vals = non_blank.values
+        top_modes = pd.Series(vals).mode()
+        if top_modes.empty:
+            continue
+        topval = top_modes.iloc[0]
+        same_count = (vals == topval).sum()
+        frac = same_count / len(non_blank)
+        if frac >= threshold:
+            straightliners[idx] = {
+                "value": topval,
+                "same_count": int(same_count),
+                "total": int(len(non_blank)),
+                "fraction": float(frac)
+            }
+    return straightliners
+
+
+def parse_skip_expression_to_mask(expr, df):
+    try:
+        expr2 = expr.replace("AND", "&").replace("and", "&").replace("OR", "|").replace("or", "|")
+        for col in df.columns:
+            expr2 = re.sub(rf'\b{re.escape(col)}\b', f"df[{repr(col)}]", expr2)
+        mask = eval(expr2, {"df": df, "np": np, "pd": pd})
+        return mask.fillna(False).astype(bool)
+    except Exception:
+        return pd.Series(False, index=df.index)
+
+
 # ---------------- Session state holders ----------------
 if "rules_buf" not in st.session_state:
     st.session_state["rules_buf"] = None
